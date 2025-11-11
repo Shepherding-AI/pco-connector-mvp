@@ -2,7 +2,7 @@
 import os
 import base64
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
@@ -19,7 +19,9 @@ def auth_header():
         "Accept": "application/json"
     }
 
-app = FastAPI(title="Planning Center Connector (MVP)")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+servers = [{"url": PUBLIC_BASE_URL}] if PUBLIC_BASE_URL else []
+app = FastAPI(title="Planning Center Connector (MVP)", servers=servers)
 
 # CORS (handy for quick tests)
 origins = (os.getenv("CORS_ORIGINS") or "*").split(",")
@@ -38,9 +40,6 @@ def health():
 @app.get("/pco/people/find")
 async def find_person(name: str = Query(..., description="Full or partial name"),
                       page_size: int = Query(5, ge=1, le=100)):
-    """
-    MVP: Search people by name and return basic contact info.
-    """
     url = "https://api.planningcenteronline.com/people/v2/people"
     params = {
         "where[name]": name,
@@ -48,7 +47,6 @@ async def find_person(name: str = Query(..., description="Full or partial name")
         "page[size]": page_size
     }
     headers = auth_header()
-
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, headers=headers, params=params)
         if r.status_code != 200:
@@ -57,7 +55,6 @@ async def find_person(name: str = Query(..., description="Full or partial name")
 
     included = {f"{i.get('type')}:{i.get('id')}": i for i in data.get("included", [])} if data.get("included") else {}
     results = []
-
     for item in data.get("data", []):
         attrs = item.get("attributes", {})
         rel = item.get("relationships", {})
@@ -97,34 +94,19 @@ async def services_plans(
     from_date: Optional[str] = Query(None, description="Optional ISO date (YYYY-MM-DD) to filter after"),
     to_date: Optional[str] = Query(None, description="Optional ISO date (YYYY-MM-DD) to filter before"),
 ):
-    """
-    Fetch plans for a given service type.
-    Notes:
-      - Date filtering in PCO Services varies; we pass basic params and rely on includes.
-      - For MVP we fetch recent plans and let the client filter by date if needed.
-    """
     base = f"https://api.planningcenteronline.com/services/v2/service_types/{service_type_id}/plans"
-
-    params = {
-        "include": include,
-        "page[size]": page_size
-    }
-
+    params = {"include": include, "page[size]": page_size}
     headers = auth_header()
-
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(base, headers=headers, params=params)
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
         data = r.json()
 
-    # Normalize key plan details + selected includes if present
     included = {f"{i.get('type')}:{i.get('id')}": i for i in data.get("included", [])} if data.get("included") else {}
     plans_out = []
     for item in data.get("data", []):
         attrs = item.get("attributes", {})
-
-        # Extract plan times from relationships if included
         rel = item.get("relationships", {})
         times = []
         if rel.get("plan_times", {}).get("data"):
@@ -157,7 +139,6 @@ async def services_plans(
             "needed_positions": needed_positions,
         })
 
-    # Optional local date filtering if from/to provided
     if from_date or to_date:
         filtered = []
         for p in plans_out:
@@ -178,17 +159,20 @@ async def services_plan_detail(
     plan_id: str = Query(..., description="PCO Services plan id"),
     include: str = Query("plan_times,needed_positions,team_members,team_members.person", description="Includes for detail"),
 ):
-    """
-    Fetch a single plan (by id) with common includes for 'who is scheduled' style reads.
-    """
     base = f"https://api.planningcenteronline.com/services/v2/plans/{plan_id}"
     params = { "include": include }
     headers = auth_header()
-
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(base, headers=headers, params=params)
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
         data = r.json()
-
     return data
+
+
+@app.get("/openapi-chatgpt.json")
+def openapi_chatgpt(request: Request):
+    spec = app.openapi()
+    base_url = str(request.base_url).rstrip("/")
+    spec["servers"] = [{"url": base_url}]
+    return spec
