@@ -1,4 +1,3 @@
-
 import os, base64
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -7,7 +6,6 @@ import httpx
 
 APP_ID = os.getenv("PCO_APP_ID")
 APP_SECRET = os.getenv("PCO_SECRET")
-
 def auth_header():
     if not APP_ID or not APP_SECRET:
         raise RuntimeError("Missing PCO_APP_ID or PCO_SECRET environment variables.")
@@ -18,10 +16,12 @@ def auth_header():
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 servers = [{"url": PUBLIC_BASE_URL}] if PUBLIC_BASE_URL else []
 app = FastAPI(title="Planning Center Connector (MVP)", servers=servers)
-
 origins = (os.getenv("CORS_ORIGINS") or "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in origins],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+DEFAULT_SERVICE_TYPE_ID = os.getenv("DEFAULT_SERVICE_TYPE_ID")
+DEFAULT_SERVICE_TYPE_NAME = os.getenv("DEFAULT_SERVICE_TYPE_NAME")
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -33,7 +33,6 @@ def openapi_chatgpt(request: Request):
     spec["servers"] = [{"url": base_url}]
     return spec
 
-# -------- People --------
 @app.get("/pco/people/find")
 async def find_person(name: str = Query(...), page_size: int = Query(5, ge=1, le=100)):
     url = "https://api.planningcenteronline.com/people/v2/people"
@@ -63,7 +62,6 @@ async def find_person(name: str = Query(...), page_size: int = Query(5, ge=1, le
                         "emails": emails, "phones": phones})
     return {"count": len(results), "people": results}
 
-# -------- Services: Helpers --------
 async def _fetch_service_types(headers, page_size=50, max_pages=5):
     url = "https://api.planningcenteronline.com/services/v2/service_types"
     params = {"page[size]": min(max(page_size, 1), 100)}
@@ -99,7 +97,24 @@ def _best_name_matches(items, query):
     scored.sort(key=lambda t: (-t[0], ((t[1].get('attributes') or {}).get('sequence') or 99999)))
     return [s[1] for s in scored]
 
-# -------- Services: Service Types --------
+async def _resolve_default_service_type_id(headers) -> Optional[str]:
+    if DEFAULT_SERVICE_TYPE_ID:
+        return DEFAULT_SERVICE_TYPE_ID
+    if DEFAULT_SERVICE_TYPE_NAME:
+        items = await _fetch_service_types(headers, page_size=100, max_pages=5)
+        matches = _best_name_matches(items, DEFAULT_SERVICE_TYPE_NAME)
+        if matches:
+            return matches[0].get("id")
+    return None
+
+@app.get("/pco/services/default-service-type")
+async def get_default_service_type():
+    headers = auth_header()
+    resolved = await _resolve_default_service_type_id(headers)
+    return {"DEFAULT_SERVICE_TYPE_ID": DEFAULT_SERVICE_TYPE_ID,
+            "DEFAULT_SERVICE_TYPE_NAME": DEFAULT_SERVICE_TYPE_NAME,
+            "resolved_service_type_id": resolved}
+
 @app.get("/pco/services/service-types")
 async def list_service_types(page_size: int = Query(50, ge=1, le=100), max_pages: int = Query(5, ge=1, le=20)):
     headers = auth_header()
@@ -115,7 +130,16 @@ async def resolve_service_type(query: str = Query(...), page_size: int = Query(5
     out = [_normalize_service_type(m) for m in matches]
     return {"query": query, "matches": out, "count": len(out)}
 
-# -------- Services: Plans --------
+# Aliases for compatibility
+@app.get("/pco/services/types")
+async def list_types_alias(page_size: int = Query(50, ge=1, le=100), max_pages: int = Query(5, ge=1, le=20)):
+    return await list_service_types(page_size=page_size, max_pages=max_pages)
+
+@app.get("/pco/services/types/resolve")
+async def resolve_types_alias(query: str = Query(...), page_size: int = Query(50, ge=1, le=100),
+                               max_pages: int = Query(5, ge=1, le=20)):
+    return await resolve_service_type(query=query, page_size=page_size, max_pages=max_pages)
+
 @app.get("/pco/services/plans")
 async def services_plans(service_type_id: Optional[str] = Query(None),
                          service_type_name: Optional[str] = Query(None),
@@ -129,7 +153,9 @@ async def services_plans(service_type_id: Optional[str] = Query(None),
         if not matches: raise HTTPException(status_code=404, detail=f"No service type matched '{service_type_name}'.")
         service_type_id = matches[0].get("id")
     if not service_type_id:
-        raise HTTPException(status_code=422, detail="Provide service_type_id or service_type_name.")
+        service_type_id = await _resolve_default_service_type_id(headers)
+    if not service_type_id:
+        raise HTTPException(status_code=422, detail="Provide service_type_id or service_type_name, or set defaults via env.")
 
     base = f"https://api.planningcenteronline.com/services/v2/service_types/{service_type_id}/plans"
     params = {"include": include, "page[size]": page_size}
@@ -167,7 +193,6 @@ async def services_plans(service_type_id: Optional[str] = Query(None),
         plans_out = filtered
     return {"count": len(plans_out), "plans": plans_out}
 
-# -------- Services: Plan Detail --------
 @app.get("/pco/services/plan")
 async def services_plan_detail(plan_id: str = Query(...),
                                include: str = Query("plan_times,needed_positions,team_members,team_members.person")):
