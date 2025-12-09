@@ -2,7 +2,55 @@ import os, base64
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import httpx, base64, time
+
+TOKEN_URL = "https://api.planningcenteronline.com/oauth/token"
+
+async def exchange_code_for_token(code: str) -> dict:
+    """
+    Try both credential placements:
+    1) client_id/client_secret in POST body
+    2) HTTP Basic Authorization header
+    Return a dict; if not ok, include {"error": "...", "status": ..., "body": "..."} for debugging.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": os.getenv("PCO_REDIRECT_URI"),
+            "client_id": os.getenv("PCO_CLIENT_ID"),
+            "client_secret": os.getenv("PCO_CLIENT_SECRET"),
+        }
+        # Attempt 1: credentials in body
+        r = await client.post(TOKEN_URL, data=form)
+        if r.status_code == 200:
+            return r.json()
+
+        # Attempt 2: HTTP Basic with client_id:client_secret (remove from body for strict servers)
+        basic = base64.b64encode(
+            f"{os.getenv('PCO_CLIENT_ID')}:{os.getenv('PCO_CLIENT_SECRET')}".encode("utf-8")
+        ).decode("utf-8")
+        form2 = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": os.getenv("PCO_REDIRECT_URI"),
+        }
+        r2 = await client.post(
+            TOKEN_URL,
+            data=form2,
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        if r2.status_code == 200:
+            return r2.json()
+
+        # Return detailed error so we see WHY it failed
+        return {
+            "error": "token_exchange_failed",
+            "status": r2.status_code,
+            "body": r2.text,
+            "hint": "Check redirect_uri exact match, client id/secret, and that your Planning Center OAuth app is configured.",
+        }
+
 
 APP_ID = os.getenv("PCO_APP_ID")
 APP_SECRET = os.getenv("PCO_SECRET")
