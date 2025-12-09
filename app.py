@@ -53,7 +53,7 @@ async def exchange_code_for_token(code: str) -> dict:
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": PCO_REDIRECT_URI,
+            "redirect_uri": PCO_REDIRECT_URL,
             "client_id": PCO_CLIENT_ID,
             "client_secret": PCO_CLIENT_SECRET,
         }
