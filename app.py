@@ -33,6 +33,59 @@ def openapi_chatgpt(request: Request):
     spec["servers"] = [{"url": base_url}]
     return spec
 
+from urllib.parse import urlencode
+from fastapi.responses import RedirectResponse
+
+PCO_CLIENT_ID = os.getenv("PCO_CLIENT_ID")
+PCO_CLIENT_SECRET = os.getenv("PCO_CLIENT_SECRET")
+PCO_REDIRECT_URI = os.getenv("PCO_REDIRECT_URI")
+PCO_SCOPES = os.getenv("PCO_SCOPES", "people services")
+
+AUTH_URL = "https://api.planningcenteronline.com/oauth/authorize"
+TOKEN_URL = "https://api.planningcenteronline.com/oauth/token"
+
+TOKEN_STORE = {}
+import time, httpx
+def tenant_key_from_request(request: Request) -> str: return "default"
+
+async def exchange_code_for_token(code: str) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": PCO_REDIRECT_URI,
+            "client_id": PCO_CLIENT_ID,
+            "client_secret": PCO_CLIENT_SECRET,
+        }
+        r = await client.post(TOKEN_URL, data=data)
+        r.raise_for_status()
+        return r.json()
+
+@app.get("/connect")
+def connect_to_planning_center():
+    if not (PCO_CLIENT_ID and PCO_REDIRECT_URI):
+        raise HTTPException(status_code=500, detail="OAuth not configured on server.")
+    params = {
+        "client_id": PCO_CLIENT_ID,
+        "redirect_uri": PCO_REDIRECT_URI,
+        "response_type": "code",
+        "scope": PCO_SCOPES,
+    }
+    return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request, code: str = Query(...), error: str | None = None):
+    if error:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
+    token_payload = await exchange_code_for_token(code)
+    TOKEN_STORE["default"] = {
+        "access_token": token_payload["access_token"],
+        "refresh_token": token_payload.get("refresh_token"),
+        "expires_at": time.time() + int(token_payload.get("expires_in", 3600)),
+    }
+    return {"connected": True}
+
+
 @app.get("/pco/people/find")
 async def find_person(name: str = Query(...), page_size: int = Query(5, ge=1, le=100)):
     url = "https://api.planningcenteronline.com/people/v2/people"
