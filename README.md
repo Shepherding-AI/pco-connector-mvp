@@ -1,2 +1,1 @@
-# Planning Center Connector — OAuth 2.0 PLUS (FastAPI)
-See /openapi-chatgpt.json and /connect → /auth/callback.
+# Railway Fix Patch: sets Python 3.11 and 3.9-safe typing

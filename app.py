@@ -1,5 +1,5 @@
 import os, time, base64, hashlib, secrets, asyncio
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -10,7 +10,11 @@ from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 import httpx
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
-app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI)", servers=[{"url": PUBLIC_BASE_URL}] if PUBLIC_BASE_URL else None)
+# Avoid passing None to servers param; let FastAPI set default
+if PUBLIC_BASE_URL:
+    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI)", servers=[{"url": PUBLIC_BASE_URL}])
+else:
+    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI)")
 
 app.add_middleware(ProxyHeadersMiddleware)
 origins = (os.getenv("CORS_ORIGINS") or "*").split(",")
@@ -30,7 +34,7 @@ TOKEN_URL = "https://api.planningcenteronline.com/oauth/token"
 DEFAULT_SERVICE_TYPE_ID = os.getenv("DEFAULT_SERVICE_TYPE_ID")
 DEFAULT_SERVICE_TYPE_NAME = os.getenv("DEFAULT_SERVICE_TYPE_NAME")
 
-TOKEN_STORE = {}
+TOKEN_STORE: Dict[str, Dict[str, Any]] = {}
 
 def tenant_key_from_request(request: Request) -> str:
     return "default"
@@ -38,7 +42,7 @@ def tenant_key_from_request(request: Request) -> str:
 def jsonapi_headers_bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
 
-async def pco_get(url: str, headers: dict, params: dict | None = None, max_retries: int = 3):
+async def pco_get(url: str, headers: dict, params: Optional[dict] = None, max_retries: int = 3):
     attempt = 0
     async with httpx.AsyncClient(timeout=25) as client:
         while True:
@@ -123,10 +127,11 @@ async def auth_callback(request: Request, code: str = Query(...), state: Optiona
     return {"connected": True, "tenant": tkey, "expires_in": token_payload.get("expires_in"), "has_refresh": bool(token_payload.get("refresh_token"))}
 
 # Helpers for Services
-async def _fetch_service_types(headers, page_size=50, max_pages=5):
+async def _fetch_service_types(headers: dict, page_size: int = 50, max_pages: int = 5):
     url = "https://api.planningcenteronline.com/services/v2/service_types"
     params = {"page[size]": min(max(page_size, 1), 100)}
-    items, pages = [], 0
+    items = []
+    pages = 0
     while url and pages < max_pages:
         r = await pco_get(url, headers, params if pages == 0 else None)
         if r.status_code != 200: raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -134,11 +139,11 @@ async def _fetch_service_types(headers, page_size=50, max_pages=5):
         url = (payload.get("links") or {}).get("next"); pages += 1
     return items
 
-def _normalize_service_type(item):
+def _normalize_service_type(item: dict):
     attrs = item.get("attributes", {}) if item else {}
     return {"id": item.get("id"), "name": attrs.get("name"), "folder_name": attrs.get("folder_name"), "sequence": attrs.get("sequence")}
 
-def _best_name_matches(items, query):
+def _best_name_matches(items, query: Optional[str]):
     q = (query or "").strip().lower(); scored = []
     for it in items:
         name = (it.get("attributes", {}) or {}).get("name") or ""
@@ -150,7 +155,7 @@ def _best_name_matches(items, query):
     scored.sort(key=lambda t: (-t[0], ((t[1].get('attributes') or {}).get('sequence') or 99999)))
     return [s[1] for s in scored]
 
-async def _resolve_default_service_type_id(headers) -> Optional[str]:
+async def _resolve_default_service_type_id(headers: dict) -> Optional[str]:
     if DEFAULT_SERVICE_TYPE_ID: return DEFAULT_SERVICE_TYPE_ID
     if DEFAULT_SERVICE_TYPE_NAME:
         items = await _fetch_service_types(headers, page_size=100, max_pages=5)
