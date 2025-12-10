@@ -1,4 +1,4 @@
-import os, time, base64, hashlib, secrets, asyncio
+import os, time, base64, hashlib, secrets, asyncio, json
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode
 
@@ -9,33 +9,40 @@ from starlette.middleware.sessions import SessionMiddleware
 
 # --- BEGIN PATCH: proxy headers safe import ---
 try:
-    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # Preferred (Starlette >= 0.14)
-except Exception:  # Starlette too old or module missing
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # Preferred
+except Exception:
     try:
         from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware  # Fallback
     except Exception:
-        class ProxyHeadersMiddleware:  # No-op shim
+        class ProxyHeadersMiddleware:
             def __init__(self, app, **kwargs):
                 self.app = app
             async def __call__(self, scope, receive, send):
                 await self.app(scope, receive, send)
 # --- END PATCH ---
+
 import httpx
+import redis.asyncio as redis
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
-# Avoid passing None to servers param; let FastAPI set default
 if PUBLIC_BASE_URL:
-    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI)", servers=[{"url": PUBLIC_BASE_URL}])
+    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI, Redis)", servers=[{"url": PUBLIC_BASE_URL}])
 else:
-    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI)")
+    app = FastAPI(title="Planning Center Connector (OAuth+JSONAPI, Redis)")
 
+# Respect X-Forwarded-Proto
 app.add_middleware(ProxyHeadersMiddleware)
-origins = (os.getenv("CORS_ORIGINS") or "*").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in origins], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# CORS
+origins = (os.getenv("CORS_ORIGINS") or "*").split(",")
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in origins],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Session for OAuth state/PKCE
 SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY", "change-me")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY, same_site="lax", https_only=True)
 
+# OAuth config
 PCO_CLIENT_ID = os.getenv("PCO_CLIENT_ID")
 PCO_CLIENT_SECRET = os.getenv("PCO_CLIENT_SECRET")
 PCO_REDIRECT_URI = os.getenv("PCO_REDIRECT_URI")
@@ -44,16 +51,58 @@ PCO_SCOPES = os.getenv("PCO_SCOPES", "people services")
 AUTH_URL = "https://api.planningcenteronline.com/oauth/authorize"
 TOKEN_URL = "https://api.planningcenteronline.com/oauth/token"
 
+# Defaults
 DEFAULT_SERVICE_TYPE_ID = os.getenv("DEFAULT_SERVICE_TYPE_ID")
 DEFAULT_SERVICE_TYPE_NAME = os.getenv("DEFAULT_SERVICE_TYPE_NAME")
 
-TOKEN_STORE: Dict[str, Dict[str, Any]] = {}
+# Redis
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client: Optional[redis.Redis] = None
 
-def tenant_key_from_request(request: Request) -> str:
+@app.on_event("startup")
+async def _redis_startup():
+    global redis_client
+    if not REDIS_URL:
+        # Allow app to start, but usage will 503
+        return
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await redis_client.ping()
+    except Exception as e:
+        # Fail fast to avoid subtle runtime 503s
+        raise RuntimeError(f"Cannot connect to Redis at {REDIS_URL}: {e}")
+
+@app.on_event("shutdown")
+async def _redis_shutdown():
+    if redis_client:
+        await redis_client.aclose()
+
+# Helpers for token storage in Redis
+def _tenant(request: Request) -> str:
     return "default"
 
+async def _redis_get_token(tenant: str) -> Optional[dict]:
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not configured (REDIS_URL missing).")
+    raw = await redis_client.get(f"pco:{tenant}:token")
+    return json.loads(raw) if raw else None
+
+async def _redis_set_token(tenant: str, token: dict, ttl_seconds: Optional[int] = None):
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not configured (REDIS_URL missing).")
+    key = f"pco:{tenant}:token"
+    val = json.dumps(token)
+    if ttl_seconds and ttl_seconds > 0:
+        await redis_client.setex(key, ttl_seconds, val)
+    else:
+        await redis_client.set(key, val)
+
 def jsonapi_headers_bearer(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.api+json",
+        "Content-Type": "application/vnd.api+json",
+    }
 
 async def pco_get(url: str, headers: dict, params: Optional[dict] = None, max_retries: int = 3):
     attempt = 0
@@ -86,18 +135,21 @@ async def refresh_access_token(refresh_token: str) -> dict:
         r = await client.post(TOKEN_URL, data=data); r.raise_for_status(); return r.json()
 
 async def get_valid_access_token(tkey: str) -> str:
-    entry = TOKEN_STORE.get(tkey)
-    if not entry: raise HTTPException(status_code=401, detail="Not connected to Planning Center. Visit /connect.")
+    entry = await _redis_get_token(tkey)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Not connected to Planning Center. Visit /connect.")
     if entry.get("expires_at") and entry["expires_at"] - time.time() < 60 and entry.get("refresh_token"):
         newt = await refresh_access_token(entry["refresh_token"])
         entry["access_token"] = newt["access_token"]
         entry["refresh_token"] = newt.get("refresh_token", entry["refresh_token"])
         entry["expires_at"] = time.time() + int(newt.get("expires_in", 3600))
-        TOKEN_STORE[tkey] = entry
+        await _redis_set_token(tkey, entry, ttl_seconds=int(newt.get("expires_in", 3600)) + 300)
     return entry["access_token"]
 
 @app.get("/health")
-def health(): return {"ok": True}
+async def health():
+    # Do not ping Redis each time; just report if client exists
+    return {"ok": True, "redis": bool(redis_client)}
 
 @app.get("/openapi-chatgpt.json")
 def openapi_chatgpt(request: Request):
@@ -133,18 +185,19 @@ async def auth_callback(request: Request, code: str = Query(...), state: Optiona
     token_payload = await exchange_code_for_token(code, code_verifier=code_verifier)
     if "error" in token_payload:
         raise HTTPException(status_code=token_payload.get("status", 500), detail={"message": token_payload["error"], "upstream": token_payload.get("body")})
-    tkey = tenant_key_from_request(request)
-    TOKEN_STORE[tkey] = {"access_token": token_payload["access_token"], "refresh_token": token_payload.get("refresh_token"),
-                         "expires_at": time.time() + int(token_payload.get("expires_in", 3600))}
+    tkey = _tenant(request)
+    entry = {"access_token": token_payload["access_token"],
+             "refresh_token": token_payload.get("refresh_token"),
+             "expires_at": time.time() + int(token_payload.get("expires_in", 3600))}
+    await _redis_set_token(tkey, entry, ttl_seconds=int(token_payload.get("expires_in", 3600)) + 300)
     request.session.pop("oauth_state", None); request.session.pop("pkce_verifier", None)
     return {"connected": True, "tenant": tkey, "expires_in": token_payload.get("expires_in"), "has_refresh": bool(token_payload.get("refresh_token"))}
 
-# Helpers for Services
+# ---- Helpers for Services ----
 async def _fetch_service_types(headers: dict, page_size: int = 50, max_pages: int = 5):
     url = "https://api.planningcenteronline.com/services/v2/service_types"
     params = {"page[size]": min(max(page_size, 1), 100)}
-    items = []
-    pages = 0
+    items = []; pages = 0
     while url and pages < max_pages:
         r = await pco_get(url, headers, params if pages == 0 else None)
         if r.status_code != 200: raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -176,11 +229,11 @@ async def _resolve_default_service_type_id(headers: dict) -> Optional[str]:
         if matches: return matches[0].get("id")
     return None
 
-# People
+# ---- People ----
 @app.get("/pco/people/find")
 async def find_person(request: Request, name: str = Query(..., description="Full or partial name"),
                       page_size: int = Query(5, ge=1, le=100), **fields):
-    token = await get_valid_access_token(tenant_key_from_request(request))
+    token = await get_valid_access_token(_tenant(request))
     headers = jsonapi_headers_bearer(token)
     params = {"where[name]": name, "include": "emails,phone_numbers", "page[size]": page_size}
     for k, v in fields.items():
@@ -205,17 +258,17 @@ async def find_person(request: Request, name: str = Query(..., description="Full
                         "emails": emails, "phones": phones})
     return {"count": len(results), "people": results}
 
-# Services: Service Types
+# ---- Services: Service Types ----
 @app.get("/pco/services/service-types")
 async def list_service_types(request: Request, page_size: int = Query(50, ge=1, le=100), max_pages: int = Query(5, ge=1, le=20)):
-    token = await get_valid_access_token(tenant_key_from_request(request))
+    token = await get_valid_access_token(_tenant(request))
     headers = jsonapi_headers_bearer(token)
     items = await _fetch_service_types(headers, page_size=page_size, max_pages=max_pages)
     return {"count": len(items), "service_types": [_normalize_service_type(i) for i in items]}
 
 @app.get("/pco/services/service-types/resolve")
 async def resolve_service_type(request: Request, query: str = Query(...), page_size: int = Query(50, ge=1, le=100), max_pages: int = Query(5, ge=1, le=20)):
-    token = await get_valid_access_token(tenant_key_from_request(request))
+    token = await get_valid_access_token(_tenant(request))
     headers = jsonapi_headers_bearer(token)
     items = await _fetch_service_types(headers, page_size=page_size, max_pages=max_pages)
     matches = _best_name_matches(items, query)
@@ -231,11 +284,11 @@ async def list_types_alias(request: Request, page_size: int = Query(50, ge=1, le
 async def resolve_types_alias(request: Request, query: str = Query(...), page_size: int = Query(50, ge=1, le=100), max_pages: int = Query(5, ge=1, le=20)):
     return await resolve_service_type(request, query=query, page_size=page_size, max_pages=max_pages)
 
-# Services: Plans & Plan Detail
+# ---- Services: Plans & Plan Detail ----
 @app.get("/pco/services/plans")
 async def services_plans(request: Request, service_type_id: Optional[str] = Query(None), service_type_name: Optional[str] = Query(None),
                          page_size: int = Query(10, ge=1, le=100), include: str = Query("plan_times,needed_positions,team_members"), **fields):
-    token = await get_valid_access_token(tenant_key_from_request(request))
+    token = await get_valid_access_token(_tenant(request))
     headers = jsonapi_headers_bearer(token)
     use_id = service_type_id
     if not use_id and service_type_name:
@@ -272,7 +325,7 @@ async def services_plans(request: Request, service_type_id: Optional[str] = Quer
 
 @app.get("/pco/services/plan")
 async def services_plan_detail(request: Request, plan_id: str = Query(...), include: str = Query("plan_times,needed_positions,team_members,team_members.person"), **fields):
-    token = await get_valid_access_token(tenant_key_from_request(request))
+    token = await get_valid_access_token(_tenant(request))
     headers = jsonapi_headers_bearer(token)
     base = f"https://api.planningcenteronline.com/services/v2/plans/{plan_id}"
     params = {"include": include}
