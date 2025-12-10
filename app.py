@@ -6,7 +6,20 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+
+# --- BEGIN PATCH: proxy headers safe import ---
+try:
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # Preferred (Starlette >= 0.14)
+except Exception:  # Starlette too old or module missing
+    try:
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware  # Fallback
+    except Exception:
+        class ProxyHeadersMiddleware:  # No-op shim
+            def __init__(self, app, **kwargs):
+                self.app = app
+            async def __call__(self, scope, receive, send):
+                await self.app(scope, receive, send)
+# --- END PATCH ---
 import httpx
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
@@ -268,16 +281,3 @@ async def services_plan_detail(request: Request, plan_id: str = Query(...), incl
     r = await pco_get(base, headers, params)
     if r.status_code != 200: raise HTTPException(status_code=r.status_code, detail=r.text)
     return r.json()
-// --- BEGIN PATCH: proxy headers safe import ---
-try:
-    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # Preferred
-except Exception:  # Starlette too old or module missing
-    try:
-        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware  # Fallback
-    except Exception:
-        class ProxyHeadersMiddleware:  # No-op shim
-            def __init__(self, app, **kwargs):
-                self.app = app
-            def __call__(self, scope, receive, send):
-                return self.app(scope, receive, send)
-// --- END PATCH ---
