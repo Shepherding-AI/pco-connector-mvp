@@ -1,1 +1,2 @@
-# Types alias added: /pco/services/types and /pco/services/types/resolve
+# Planning Center Connector — OAuth 2.0 PLUS (FastAPI)
+See /openapi-chatgpt.json and /connect → /auth/callback.
